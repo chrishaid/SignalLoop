@@ -1,0 +1,567 @@
+// SignalLoop Database Schema
+// Supporting Google Workspace MVP with extensibility for future IdPs
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// TENANT & ORGANIZATION
+// ============================================================================
+
+model Tenant {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  status    TenantStatus @default(ACTIVE)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relationships
+  idpConfigs      IdpConfig[]
+  users           User[]
+  orgUnits        OrgUnit[]
+  campaigns       Campaign[]
+  items           Item[]
+  signalTypes     SignalType[]
+  roles           Role[]
+  scopes          Scope[]
+  visibilityGroups VisibilityGroup[]
+  targetRules     TargetRule[]
+
+  @@map("tenants")
+}
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  TRIAL
+}
+
+// ============================================================================
+// IDP CONFIGURATION
+// ============================================================================
+
+model IdpConfig {
+  id           String   @id @default(cuid())
+  tenantId     String
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  provider     IdpProvider
+  status       IdpStatus @default(ACTIVE)
+
+  // OAuth/OIDC credentials
+  clientId     String
+  clientSecret String   // Encrypted in production
+  domain       String?  // e.g., company.com for Google Workspace
+
+  // Attribute mappings (JSON)
+  attributeMappings Json  // Maps IdP attributes to our fields
+
+  // Sync settings
+  syncEnabled  Boolean  @default(true)
+  syncSchedule String   @default("0 2 * * *") // Cron expression for daily sync
+  lastSyncAt   DateTime?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([tenantId, provider])
+  @@map("idp_configs")
+}
+
+enum IdpProvider {
+  GOOGLE_WORKSPACE
+  MICROSOFT_ENTRA
+  OKTA
+}
+
+enum IdpStatus {
+  ACTIVE
+  DISABLED
+  ERROR
+}
+
+// ============================================================================
+// USERS & ORGANIZATIONAL STRUCTURE
+// ============================================================================
+
+model User {
+  id            String   @id @default(cuid())
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // IdP identifiers
+  idpSubjectId  String   // Unique ID from IdP
+  primaryEmail  String
+
+  // Basic info
+  firstName     String?
+  lastName      String?
+  displayName   String?
+  avatarUrl     String?
+
+  status        UserStatus @default(ACTIVE)
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relationships
+  staffSnapshots    StaffSnapshot[]
+  signals           Signal[]
+  permissions       Permission[]
+  managedSnapshots  StaffSnapshot[] @relation("ManagerRelation")
+
+  @@unique([tenantId, idpSubjectId])
+  @@unique([tenantId, primaryEmail])
+  @@index([tenantId, status])
+  @@map("users")
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  INACTIVE
+  EXITED
+}
+
+model OrgUnit {
+  id            String   @id @default(cuid())
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name          String
+  type          String?  // e.g., "department", "region", "school", "division"
+  externalId    String?  // ID from IdP or HRIS
+
+  // Hierarchy
+  parentId      String?
+  parent        OrgUnit?  @relation("OrgHierarchy", fields: [parentId], references: [id])
+  children      OrgUnit[] @relation("OrgHierarchy")
+
+  // Path for efficient querying (e.g., "/1/2/3")
+  path          String?
+
+  metadata      Json?    // Additional attributes
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relationships
+  staffSnapshots StaffSnapshot[]
+
+  @@unique([tenantId, externalId])
+  @@index([tenantId, parentId])
+  @@index([path])
+  @@map("org_units")
+}
+
+// ============================================================================
+// STAFF SNAPSHOTS (Daily IdP Sync)
+// ============================================================================
+
+model StaffSnapshot {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  snapshotDate DateTime @db.Date
+
+  // Organizational attributes
+  managerId    String?
+  manager      User?    @relation("ManagerRelation", fields: [managerId], references: [id])
+
+  orgUnitId    String?
+  orgUnit      OrgUnit? @relation(fields: [orgUnitId], references: [id])
+
+  // Job attributes
+  jobFamily    String?
+  jobTitle     String?
+  employeeType String?  // e.g., "full_time", "part_time", "contractor"
+  level        String?
+
+  // Location
+  location     String?
+  region       String?
+  site         String?
+
+  // Employment
+  employmentStatus String?  // e.g., "active", "leave", "notice"
+  hireDate         DateTime? @db.Date
+
+  // Derived/calculated fields
+  tenureDays   Int?
+
+  // Custom attributes (flexible for different orgs)
+  customAttributes Json?
+
+  createdAt    DateTime @default(now())
+
+  // Relationships
+  signals Signal[]
+
+  @@unique([userId, snapshotDate])
+  @@index([snapshotDate])
+  @@index([managerId])
+  @@index([orgUnitId])
+  @@index([jobFamily])
+  @@map("staff_snapshots")
+}
+
+// ============================================================================
+// SIGNAL TYPES & ITEMS
+// ============================================================================
+
+model SignalType {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name        String   // e.g., "EngagementPulse", "QuickCheck"
+  displayName String
+  description String?
+
+  status      SignalTypeStatus @default(ACTIVE)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relationships
+  items       Item[]
+  signals     Signal[]
+
+  @@unique([tenantId, name])
+  @@map("signal_types")
+}
+
+enum SignalTypeStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+model Item {
+  id            String   @id @default(cuid())
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  signalTypeId  String
+  signalType    SignalType @relation(fields: [signalTypeId], references: [id], onDelete: Cascade)
+
+  // Question text
+  text          String
+  description   String?
+
+  // Scale configuration
+  scaleType     ScaleType
+  scaleConfig   Json     // Configuration for scale (labels, values, etc.)
+
+  // Categorization
+  category      String?  // e.g., "engagement", "wellbeing", "growth"
+  tags          String[] // Array of tags
+
+  status        ItemStatus @default(DRAFT)
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relationships
+  campaignItems CampaignItem[]
+  signals       Signal[]
+
+  @@index([tenantId, signalTypeId])
+  @@index([category])
+  @@map("items")
+}
+
+enum ScaleType {
+  LIKERT_5
+  LIKERT_7
+  YES_NO
+  EMOJI_5
+  SCALE_0_10
+  TEXT
+}
+
+enum ItemStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+// ============================================================================
+// CAMPAIGNS & TARGETING
+// ============================================================================
+
+model Campaign {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name        String
+  description String?
+
+  // Scheduling
+  startDate   DateTime @db.Date
+  endDate     DateTime? @db.Date
+  cadence     Cadence
+
+  // Delivery settings
+  maxTouchesPerDay  Int @default(1)
+  maxTouchesPerWeek Int @default(3)
+
+  // Time windows (JSON array of {dayOfWeek, startHour, endHour})
+  timeWindows Json?
+
+  // Blackout periods (JSON array of {startDate, endDate, reason})
+  blackouts   Json?
+
+  status      CampaignStatus @default(DRAFT)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relationships
+  campaignItems CampaignItem[]
+  targetRules   CampaignTargetRule[]
+
+  @@index([tenantId, status])
+  @@map("campaigns")
+}
+
+enum Cadence {
+  DAILY_M_F
+  DAILY
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+}
+
+enum CampaignStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  COMPLETED
+}
+
+model CampaignItem {
+  id          String   @id @default(cuid())
+  campaignId  String
+  campaign    Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  itemId      String
+  item        Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  // Rotation settings
+  weight      Int      @default(1)
+  order       Int?
+
+  createdAt   DateTime @default(now())
+
+  @@unique([campaignId, itemId])
+  @@map("campaign_items")
+}
+
+model TargetRule {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name        String
+  description String?
+
+  // Rule expression (JSON-based DSL)
+  expression  Json
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relationships
+  campaigns   CampaignTargetRule[]
+
+  @@index([tenantId])
+  @@map("target_rules")
+}
+
+model CampaignTargetRule {
+  id            String   @id @default(cuid())
+  campaignId    String
+  campaign      Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  targetRuleId  String
+  targetRule    TargetRule @relation(fields: [targetRuleId], references: [id], onDelete: Cascade)
+
+  createdAt     DateTime @default(now())
+
+  @@unique([campaignId, targetRuleId])
+  @@map("campaign_target_rules")
+}
+
+// ============================================================================
+// SIGNALS (Responses)
+// ============================================================================
+
+model Signal {
+  id              String   @id @default(cuid())
+
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  itemId          String
+  item            Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  signalTypeId    String
+  signalType      SignalType @relation(fields: [signalTypeId], references: [id], onDelete: Cascade)
+
+  staffSnapshotId String
+  staffSnapshot   StaffSnapshot @relation(fields: [staffSnapshotId], references: [id], onDelete: Cascade)
+
+  // Response value (stored as JSON to support different scale types)
+  value           Json
+
+  // Metadata
+  deliveryContext String?  // e.g., "sso_login", "email", "slack"
+  clientInfo      Json?    // Browser, OS, etc.
+
+  createdAt       DateTime @default(now())
+
+  @@index([userId])
+  @@index([itemId])
+  @@index([signalTypeId])
+  @@index([staffSnapshotId])
+  @@index([createdAt])
+  @@map("signals")
+}
+
+// ============================================================================
+// RBAC (Role-Based Access Control)
+// ============================================================================
+
+model Role {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name        String   // e.g., "Super Admin", "Manager", "Functional Leader"
+  description String?
+
+  // Capabilities (JSON array of capability strings)
+  capabilities Json    // e.g., ["view_aggregated", "export", "manage_campaigns"]
+
+  isSystem    Boolean  @default(false) // System roles can't be deleted
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relationships
+  permissions Permission[]
+
+  @@unique([tenantId, name])
+  @@map("roles")
+}
+
+model Scope {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name        String
+  description String?
+
+  scopeType   ScopeType
+
+  // Scope definition (JSON expression)
+  expression  Json
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relationships
+  permissions Permission[]
+
+  @@index([tenantId, scopeType])
+  @@map("scopes")
+}
+
+enum ScopeType {
+  REPORTING_LINE    // Based on manager hierarchy
+  FUNCTIONAL        // Based on job_family or other attributes
+  ORG_UNIT          // Based on org unit hierarchy
+  CUSTOM            // Custom rule-based
+}
+
+model Permission {
+  id        String   @id @default(cuid())
+
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  roleId    String
+  role      Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  scopeId   String
+  scope     Scope    @relation(fields: [scopeId], references: [id], onDelete: Cascade)
+
+  // Optional additional constraints
+  constraints Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, roleId, scopeId])
+  @@index([userId])
+  @@map("permissions")
+}
+
+// ============================================================================
+// VISIBILITY GROUPS (Reusable Cohorts)
+// ============================================================================
+
+model VisibilityGroup {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name        String
+  description String?
+
+  // Rule expression (JSON-based DSL)
+  expression  Json
+
+  // Privacy settings
+  minN        Int      @default(5) // Minimum responses to show data
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([tenantId])
+  @@map("visibility_groups")
+}
+
+// ============================================================================
+// AUDIT LOG
+// ============================================================================
+
+model AuditLog {
+  id          String   @id @default(cuid())
+
+  tenantId    String
+  userId      String?
+
+  action      String   // e.g., "campaign_created", "data_exported", "permission_granted"
+  resource    String   // e.g., "campaign:123", "user:456"
+
+  details     Json?
+  ipAddress   String?
+  userAgent   String?
+
+  createdAt   DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([userId])
+  @@map("audit_logs")
+}
